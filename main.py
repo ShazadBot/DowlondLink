@@ -3,36 +3,40 @@ import os
 import re
 import time
 import sqlite3
+import logging
 import asyncio
 import tempfile
 from pathlib import Path
-from urllib.parse import urlparse
-
-import yt_dlp
-from telethon import TelegramClient
-from telethon.sessions import StringSession
 
 from telegram import (
     Update,
     InlineKeyboardButton,
-    InlineKeyboardMarkup
+    InlineKeyboardMarkup,
 )
-
+from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
-    filters
+    filters,
 )
+from telegram.error import TelegramError
 
-# =====================================
-# CONFIGURATION
-# =====================================
+import yt_dlp
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# ================= CONFIG =================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "")
 
 CHANNEL_1 = "@Shblood_IT"
 CHANNEL_2 = "@PS4K2rdish"
@@ -40,516 +44,470 @@ CHANNEL_2 = "@PS4K2rdish"
 CHANNEL_1_URL = "https://t.me/Shblood_IT"
 CHANNEL_2_URL = "https://t.me/PS4K2rdish"
 
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-SESSION = os.getenv("SESSION_STRING", "")
-
 MAX_SIZE = 49 * 1024 * 1024
-DB = "shblood.db"
 
-user_client = None
+DB_NAME = "shblood_users.db"
 
-# =====================================
-# DATABASE
-# =====================================
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("ShbloodDownloader")
+
+
+# ================= DATABASE =================
 
 def init_db():
-    with sqlite3.connect(DB) as db:
+    with sqlite3.connect(DB_NAME) as db:
         db.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                user_id INTEGER PRIMARY KEY
             )
         """)
 
-def save_user(user_id):
-    with sqlite3.connect(DB) as db:
+
+def add_user(user_id):
+    with sqlite3.connect(DB_NAME) as db:
         db.execute(
-            "INSERT OR IGNORE INTO users(user_id) VALUES (?)",
+            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
             (user_id,)
         )
 
+
 def get_users():
-    with sqlite3.connect(DB) as db:
+    with sqlite3.connect(DB_NAME) as db:
         return [
-            row[0] for row in
-            db.execute("SELECT user_id FROM users")
+            row[0]
+            for row in db.execute("SELECT user_id FROM users").fetchall()
         ]
 
-# =====================================
-# CHANNEL BUTTONS
-# =====================================
+
+# ================= KEYBOARDS =================
 
 def join_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "📢 Join Shblood IT",
+                "Channel 1",
                 url=CHANNEL_1_URL
             )
         ],
         [
             InlineKeyboardButton(
-                "📢 Join PS4K2rdish",
+                "Channel 2",
                 url=CHANNEL_2_URL
             )
         ],
         [
             InlineKeyboardButton(
-                "✅ پشکنینەوە",
+                "پشکنینەوە",
                 callback_data="check_join"
             )
         ]
     ])
 
-# =====================================
-# CHANNEL VERIFICATION
-# =====================================
+
+# ================= MEMBERSHIP =================
 
 async def check_user(bot, user_id):
-
-    channels = [
-        CHANNEL_1,
-        CHANNEL_2
-    ]
-
-    for channel in channels:
+    for channel in (CHANNEL_1, CHANNEL_2):
         try:
             member = await bot.get_chat_member(
                 chat_id=channel,
                 user_id=user_id
             )
 
-            status = member.status
+            if member.status in (
+                ChatMemberStatus.LEFT,
+                ChatMemberStatus.BANNED
+            ):
+                return False
 
-            is_joined = (
-                status in (
-                    "member",
-                    "administrator",
-                    "creator"
-                )
-                or (
-                    status == "restricted"
-                    and getattr(member, "is_member", False)
-                )
+            if (
+                member.status == ChatMemberStatus.RESTRICTED
+                and not getattr(member, "is_member", False)
+            ):
+                return False
+
+        except TelegramError:
+            logger.exception(
+                "Membership check failed for %s",
+                channel
             )
+            return None
 
-            if not is_joined:
-                return False, None
+    return True
 
-        except Exception as error:
-            print(
-                f"CHANNEL CHECK ERROR {channel}: {error}"
-            )
-            return None, channel
 
-    return True, None
-
-# =====================================
-# START
-# =====================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user = update.effective_user
-    save_user(user.id)
-
-    joined, error = await check_user(
-        context.bot,
-        user.id
-    )
-
-    if error:
-        await update.message.reply_text(
-            "⚠️ کێشە لە پشکنینی چەناڵەکان هەیە.\n\n"
-            "بەڕێوەبەری بۆت دەبێت بۆتەکە Admin بکات "
-            "لە هەردوو چەناڵەکە."
-        )
-        return
-
-    if not joined:
-        context.user_data["waiting"] = False
-
-        await update.message.reply_text(
-            "👋 بەخێربێیت بۆ Shblood Downloader!\n\n"
-            "بۆ بەکارهێنانی بۆتەکە تکایە "
-            "جۆینی هەردوو چەناڵەکە بکە:",
-            reply_markup=join_keyboard()
-        )
-        return
-
-    context.user_data["waiting"] = True
-
-    await update.message.reply_text(
-        "🔥 بەخێربێیت!\n\n"
-        "تکایە لینکی ڤیدیۆی خۆت بنووسە:"
-    )
-
-# =====================================
-# RECHECK
-# =====================================
-
-async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-    await query.answer()
-
-    joined, error = await check_user(
-        context.bot,
-        query.from_user.id
-    )
-
-    if error:
-        await query.edit_message_text(
-            "⚠️ بۆت ناتوانێت ئەندامێتی بپشکنێت.\n\n"
-            f"کێشە لە چەناڵ: {error}\n"
-            "تکایە Admin ـی بۆتەکە بپشکنە."
-        )
-        return
-
-    if joined:
-
-        context.user_data["waiting"] = True
-
-        await query.edit_message_text(
-            "✅ جۆینەکەت پشتڕاستکرایەوە!\n\n"
-            "ئێستا لینکی ڤیدیۆ بنێرە."
-        )
-
-    else:
-
-        context.user_data["waiting"] = False
-
-        await query.edit_message_text(
-            "❌ هێشتا جۆینی هەردوو چەناڵەکەت نەکردووە.\n"
-            "جۆین بکە و دووبارە پشکنینەوە بکە.",
-            reply_markup=join_keyboard()
-        )
-
-# =====================================
-# URL VALIDATION
-# =====================================
-
-ALLOWED_DOMAINS = (
-    "youtube.com",
-    "youtu.be",
-    "instagram.com",
-    "twitter.com",
-    "x.com",
-    "t.me",
-    "telegram.me"
-)
-
-def valid_url(url):
-    try:
-        parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
-
-        return (
-            parsed.scheme in ("http", "https")
-            and any(
-                host == domain or host.endswith("." + domain)
-                for domain in ALLOWED_DOMAINS
-            )
-        )
-    except Exception:
-        return False
-
-# =====================================
-# TELEGRAM VIDEO
-# =====================================
-
-async def telegram_download(url, folder):
-
-    if not user_client:
-        raise Exception("Telegram session is not configured")
-
-    match = re.search(
-        r"(?:t\.me|telegram\.me)/(?:s/)?([^/?]+)/(\d+)",
-        url
-    )
-
-    private_match = re.search(
-        r"(?:t\.me|telegram\.me)/c/(\d+)/(\d+)",
-        url
-    )
-
-    if private_match:
-        entity = int("-100" + private_match.group(1))
-        message_id = int(private_match.group(2))
-
-    elif match:
-        entity = match.group(1)
-        message_id = int(match.group(2))
-
-    else:
-        raise Exception("Unsupported Telegram link")
-
-    message = await user_client.get_messages(
-        entity,
-        ids=message_id
-    )
-
-    if not message or not message.media:
-        raise Exception("Video not found")
-
-    path = await user_client.download_media(
-        message,
-        file=folder
-    )
-
-    if not path:
-        raise Exception("Download failed")
-
-    return Path(path)
-
-# =====================================
-# SOCIAL MEDIA DOWNLOAD
-# =====================================
-
-async def social_download(url, folder):
-
-    options = {
-        "format": "best[ext=mp4]/best",
-        "outtmpl": str(
-            Path(folder) / "Shblood_%(id)s.%(ext)s"
-        ),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 60,
-        "retries": 3,
-        "fragment_retries": 3,
-        "max_filesize": MAX_SIZE,
-        "merge_output_format": "mp4"
-    }
-
-    def run():
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.download([url])
-
-    await asyncio.to_thread(run)
-
-    files = list(Path(folder).glob("Shblood_*"))
-
-    if not files:
-        raise Exception("Video not found")
-
-    return files[0]
-
-# =====================================
-# HANDLE LINKS
-# =====================================
-
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
+async def require_join(update, context):
     user_id = update.effective_user.id
 
-    joined, error = await check_user(
+    result = await check_user(
         context.bot,
         user_id
     )
 
-    if error:
-        await update.message.reply_text(
-            "⚠️ کێشەی پشکنینی چەناڵەکان هەیە."
+    if result is True:
+        add_user(user_id)
+        return True
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            "تکایە سەردانی هەردوو چەناڵ بکە و پاشان پشکنینەوە بکە:",
+            reply_markup=join_keyboard()
         )
-        return
-
-    if not joined:
-        context.user_data["waiting"] = False
-
-        await update.message.reply_text(
+    else:
+        await update.effective_message.reply_text(
             "تکایە جۆینی هەردوو چەناڵ بکە:",
             reply_markup=join_keyboard()
         )
+
+    return False
+
+
+# ================= START =================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_join(update, context):
         return
 
-    if not context.user_data.get("waiting"):
-        await update.message.reply_text(
-            "بۆ دەستپێکردن /start بنووسە."
+    await update.message.reply_text(
+        "سڵاو! بەخێربێیت بۆ Shblood Downloader.\n\n"
+        "تکایە لینکی ڤیدیۆی سۆشیاڵ میدیا بنێرە."
+    )
+
+
+# ================= RECHECK =================
+
+async def check_join_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    result = await check_user(
+        context.bot,
+        query.from_user.id
+    )
+
+    if result is True:
+        add_user(query.from_user.id)
+
+        await query.edit_message_text(
+            "جۆینەکەت پشتڕاست کرایەوە!\n\n"
+            "ئێستا لینکی ڤیدیۆکە بنێرە."
         )
+    else:
+        await query.edit_message_text(
+            "تکایە جۆینی هەردوو چەناڵ بکە:",
+            reply_markup=join_keyboard()
+        )
+
+
+# ================= DOWNLOAD =================
+
+def is_valid_url(url):
+    return bool(
+        re.match(
+            r"^https?://",
+            url.strip(),
+            re.IGNORECASE
+        )
+    )
+
+
+def download_with_ytdlp(url, folder):
+    output = os.path.join(folder, "%(title).80s.%(ext)s")
+
+    options = {
+        "format": "best[ext=mp4]/best",
+        "outtmpl": output,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "max_filesize": MAX_SIZE,
+        "merge_output_format": "mp4",
+        "socket_timeout": 30,
+        "retries": 2,
+    }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=True)
+        file_path = ydl.prepare_filename(info)
+
+        if not os.path.exists(file_path):
+            mp4_path = os.path.splitext(file_path)[0] + ".mp4"
+            if os.path.exists(mp4_path):
+                file_path = mp4_path
+
+        if not os.path.exists(file_path):
+            raise Exception("Downloaded file not found")
+
+        if os.path.getsize(file_path) > MAX_SIZE:
+            raise Exception("File is too large")
+
+        return file_path, info.get("title", "Video")
+
+
+# ================= TELEGRAM DOWNLOAD =================
+
+async def download_telegram_video(url, folder):
+    if not all([API_ID, API_HASH, SESSION_STRING]):
+        raise Exception(
+            "Telegram API settings are missing"
+        )
+
+    client = TelegramClient(
+        StringSession(SESSION_STRING),
+        API_ID,
+        API_HASH
+    )
+
+    await client.connect()
+
+    try:
+        match = re.search(
+            r"t\.me/(?:c/)?([^/?]+)/(\d+)",
+            url
+        )
+
+        if not match:
+            raise Exception("Invalid Telegram post link")
+
+        channel_name = match.group(1)
+        message_id = int(match.group(2))
+
+        if channel_name.isdigit():
+            channel_name = int("-100" + channel_name)
+
+        entity = await client.get_entity(channel_name)
+        message = await client.get_messages(
+            entity,
+            ids=message_id
+        )
+
+        if not message or not message.media:
+            raise Exception("No media found")
+
+        file_path = os.path.join(folder, "telegram_video.mp4")
+
+        await client.download_media(
+            message,
+            file=file_path
+        )
+
+        if not os.path.exists(file_path):
+            raise Exception("Download failed")
+
+        if os.path.getsize(file_path) > MAX_SIZE:
+            raise Exception("File is too large")
+
+        return file_path, "Telegram Video"
+
+    finally:
+        await client.disconnect()
+
+
+# ================= VIDEO HANDLER =================
+
+async def handle_link(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not await require_join(update, context):
         return
 
     url = update.message.text.strip()
 
-    if not valid_url(url):
+    if not is_valid_url(url):
         await update.message.reply_text(
-            "❌ لینکەکە دروست نییە یان پشتگیری ناکرێت."
+            "تکایە لینکێکی دروست بنێرە."
         )
         return
 
-    context.user_data["waiting"] = False
-
-    waiting = await update.message.reply_text(
-        "⏳ چاوەڕێبە...\n"
-        "ڤیدیۆکەت ئامادە دەکرێت."
+    status = await update.message.reply_text(
+        "چاوەڕێبە... ڤیدیۆکە پشکنین و داگیراوە."
     )
 
-    started = time.monotonic()
+    folder = tempfile.mkdtemp(prefix="shblood_")
 
     try:
-        with tempfile.TemporaryDirectory() as folder:
+        await asyncio.sleep(3)
 
-            host = (urlparse(url).hostname or "").lower()
-
-            if host in ("t.me", "telegram.me"):
-                video = await telegram_download(url, folder)
-            else:
-                video = await social_download(url, folder)
-
-            if not video.exists():
-                raise Exception("File missing")
-
-            if video.stat().st_size > MAX_SIZE:
-                raise Exception("Video exceeds file limit")
-
-            remaining = 4 - (time.monotonic() - started)
-
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-
-            await waiting.edit_text(
-                "✅ ڤیدیۆ ئامادەیە!"
+        if "t.me/" in url:
+            file_path, title = await download_telegram_video(
+                url,
+                folder
+            )
+        else:
+            file_path, title = await asyncio.to_thread(
+                download_with_ytdlp,
+                url,
+                folder
             )
 
-            caption = (
-                "ShbloodTeam\n\n"
-                "ڤیدیۆ هات بەبێ لۆگۆ\n"
-                "TeamShblood"
+        await status.edit_text(
+            "ڤیدیۆ ئامادەیە!"
+        )
+
+        with open(file_path, "rb") as video:
+            await update.message.reply_video(
+                video=video,
+                caption=(
+                    f"{title[:700]}\n\n"
+                    "ڤیدیۆ هات بەبێ لۆگۆ\n"
+                    "ShbloodTeam"
+                ),
+                supports_streaming=True
             )
 
-            with open(video, "rb") as file:
-
-                if video.suffix.lower() == ".mp4":
-                    await update.message.reply_video(
-                        video=file,
-                        caption=caption,
-                        supports_streaming=True,
-                        read_timeout=300,
-                        write_timeout=300
-                    )
-                else:
-                    await update.message.reply_document(
-                        document=file,
-                        caption=caption,
-                        read_timeout=300,
-                        write_timeout=300
-                    )
+        await status.delete()
 
     except Exception as error:
+        logger.exception("Download failed")
 
-        print("DOWNLOAD ERROR:", repr(error))
-
-        await waiting.edit_text(
-            "❌ دابەزاندنی ڤیدیۆ سەرکەوتوو نەبوو.\n\n"
-            "لینکەکە بپشکنە یان لینکێکی تر بنێرە."
+        await status.edit_text(
+            "داگرتنی ڤیدیۆکە سەرکەوتوو نەبوو.\n"
+            "تکایە لینکێکی تر تاقی بکەرەوە."
         )
 
     finally:
-        context.user_data["waiting"] = True
+        for file in Path(folder).glob("*"):
+            try:
+                file.unlink()
+            except OSError:
+                pass
 
-# =====================================
-# ADMIN STATS
-# =====================================
+        try:
+            Path(folder).rmdir()
+        except OSError:
+            pass
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if update.effective_user.id != ADMIN_ID:
+# ================= ADMIN =================
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID and ADMIN_ID != 0
+
+
+async def stats(update, context):
+    if not is_admin(update.effective_user.id):
         return
 
+    users = get_users()
+
     await update.message.reply_text(
-        f"👥 بەکارهێنەران: {len(get_users())}"
+        f"ئاماری Shblood Downloader\n\n"
+        f"کۆی بەکارهێنەران: {len(users)}"
     )
 
-# =====================================
-# ADMIN BROADCAST
-# =====================================
 
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_user.id != ADMIN_ID:
+async def broadcast(update, context):
+    if not is_admin(update.effective_user.id):
         return
 
     message = " ".join(context.args)
 
     if not message:
         await update.message.reply_text(
-            "بەکارهێنان:\n/broadcast نامەکەت"
+            "بەکارهێنان:\n/broadcast پەیامەکەت"
         )
         return
 
+    users = get_users()
     success = 0
+    failed = 0
 
-    for user_id in get_users():
+    status = await update.message.reply_text(
+        "ناردنی پەیامەکان دەستی پێکرد..."
+    )
+
+    for user_id in users:
         try:
             await context.bot.send_message(
                 chat_id=user_id,
                 text=message
             )
             success += 1
-        except Exception as error:
-            print("BROADCAST ERROR:", error)
+        except TelegramError:
+            failed += 1
+
+        await asyncio.sleep(0.05)
+
+    await status.edit_text(
+        f"تەواو بوو!\n\n"
+        f"سەرکەوتوو: {success}\n"
+        f"سەرنەکەوتوو: {failed}"
+    )
+
+
+async def update_command(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    message = " ".join(context.args)
+
+    if not message:
+        await update.message.reply_text(
+            "بەکارهێنان:\n/update پەیامی نوێ"
+        )
+        return
+
+    users = get_users()
+
+    for user_id in users:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "ئاگادارکردنەوەی نوێی Shblood\n\n"
+                    + message
+                )
+            )
+        except TelegramError:
+            pass
 
         await asyncio.sleep(0.05)
 
     await update.message.reply_text(
-        f"✅ نێردرا بۆ {success} بەکارهێنەر."
+        "ئاگادارکردنەوەکە نێردرا."
     )
 
-# =====================================
-# TELEGRAM USER SESSION
-# =====================================
 
-async def post_init(app):
+# ================= ERRORS =================
 
-    global user_client
+async def error_handler(update, context):
+    logger.exception(
+        "Bot error:",
+        exc_info=context.error
+    )
 
-    if SESSION and API_ID and API_HASH:
 
-        user_client = TelegramClient(
-            StringSession(SESSION),
-            API_ID,
-            API_HASH
-        )
-
-        await user_client.start()
-
-        print("Telegram session connected")
-
-async def post_shutdown(app):
-
-    global user_client
-
-    if user_client:
-        await user_client.disconnect()
-
-# =====================================
-# MAIN
-# =====================================
+# ================= MAIN =================
 
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing"
+        )
 
     init_db()
-
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing")
 
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
         .build()
     )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("update", update_command))
 
     app.add_handler(
         CallbackQueryHandler(
-            check_join,
+            check_join_callback,
             pattern="^check_join$"
         )
     )
@@ -561,9 +519,14 @@ def main():
         )
     )
 
-    print("SHBLOOD DOWNLOADER STARTED")
+    app.add_error_handler(error_handler)
 
-    app.run_polling()
+    logger.info("Shblood Downloader started")
+
+    app.run_polling(
+        drop_pending_updates=True
+    )
+
 
 if __name__ == "__main__":
     main()
