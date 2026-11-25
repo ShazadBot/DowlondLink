@@ -22,7 +22,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 WELCOME = (
     "سڵاو! بەخێربێیت بۆ Shblood Downloader\n\n"
-    "تکایە لینکی سۆشیاڵ میدیای خۆت بنووسە:"
+    "تکایە لینکی سۆشیاڵ میدیا  بنووسە:"
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
